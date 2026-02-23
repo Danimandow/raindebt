@@ -1,0 +1,295 @@
+{
+  "name": "RainDebt - Daily Climate Data Collection",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "node-schedule-trigger",
+      "name": "Daily 6AM Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/properties",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "is_active", "value": "eq.true" },
+            { "name": "select", "value": "id,name,latitude,longitude,current_spi" }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "Bearer {{ $vars.SUPABASE_SERVICE_KEY }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-fetch-properties",
+      "name": "Fetch Active Properties",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "={{$json}}",
+        "options": {}
+      },
+      "id": "node-split-properties",
+      "name": "Split Properties",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://power.larc.nasa.gov/api/temporal/daily/point",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "parameters", "value": "PRECTOTCORR,T2M_MAX,T2M_MIN" },
+            { "name": "community", "value": "AG" },
+            { "name": "longitude", "value": "={{ $json.longitude }}" },
+            { "name": "latitude", "value": "={{ $json.latitude }}" },
+            { "name": "start", "value": "={{ $now.minus({days: 7}).toFormat('yyyyMMdd') }}" },
+            { "name": "end", "value": "={{ $now.minus({days: 1}).toFormat('yyyyMMdd') }}" },
+            { "name": "format", "value": "JSON" }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "allowUnauthorizedCerts": false
+        }
+      },
+      "id": "node-nasa-power",
+      "name": "NASA POWER API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 200]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://archive-api.open-meteo.com/v1/archive",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "latitude", "value": "={{ $('Split Properties').item.json.latitude }}" },
+            { "name": "longitude", "value": "={{ $('Split Properties').item.json.longitude }}" },
+            { "name": "start_date", "value": "={{ $now.minus({days: 7}).toFormat('yyyy-MM-dd') }}" },
+            { "name": "end_date", "value": "={{ $now.minus({days: 1}).toFormat('yyyy-MM-dd') }}" },
+            { "name": "daily", "value": "precipitation_sum,temperature_2m_max,temperature_2m_min" },
+            { "name": "timezone", "value": "America/Sao_Paulo" }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "node-open-meteo",
+      "name": "Open-Meteo Fallback",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Transform NASA POWER response into daily climate records\nconst nasaData = $('NASA POWER API').first().json;\nconst property = $('Split Properties').first().json;\n\nconst records = [];\n\ntry {\n  const params = nasaData.properties?.parameter || nasaData.parameter;\n  if (!params) throw new Error('No NASA data');\n\n  const precip = params.PRECTOTCORR || {};\n  const tempMax = params.T2M_MAX || {};\n  const tempMin = params.T2M_MIN || {};\n\n  for (const [dateStr, value] of Object.entries(precip)) {\n    // Skip missing values (NASA uses -999)\n    if (value === -999 || value < 0) continue;\n\n    const year = dateStr.substring(0, 4);\n    const month = dateStr.substring(4, 6);\n    const day = dateStr.substring(6, 8);\n    const isoDate = `${year}-${month}-${day}`;\n\n    const maxT = tempMax[dateStr];\n    const minT = tempMin[dateStr];\n\n    records.push({\n      property_id: property.id,\n      record_date: isoDate,\n      precipitation_mm: parseFloat(value.toFixed(2)),\n      temperature_max_c: maxT && maxT !== -999 ? parseFloat(maxT.toFixed(1)) : null,\n      temperature_min_c: minT && minT !== -999 ? parseFloat(minT.toFixed(1)) : null,\n      data_source: 'nasa_power'\n    });\n  }\n} catch (e) {\n  // If NASA fails, try Open-Meteo\n  try {\n    const meteoData = $('Open-Meteo Fallback').first().json;\n    const daily = meteoData.daily;\n    if (daily && daily.time) {\n      for (let i = 0; i < daily.time.length; i++) {\n        records.push({\n          property_id: property.id,\n          record_date: daily.time[i],\n          precipitation_mm: daily.precipitation_sum?.[i] ?? null,\n          temperature_max_c: daily.temperature_2m_max?.[i] ?? null,\n          temperature_min_c: daily.temperature_2m_min?.[i] ?? null,\n          data_source: 'open_meteo'\n        });\n      }\n    }\n  } catch (e2) {\n    // Both sources failed\n    return [{ json: { error: `Both sources failed for ${property.id}`, property_id: property.id } }];\n  }\n}\n\nif (records.length === 0) {\n  return [{ json: { error: 'No records produced', property_id: property.id } }];\n}\n\nreturn records.map(r => ({ json: r }));"
+      },
+      "id": "node-transform-data",
+      "name": "Transform Climate Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/climate_records",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "Bearer {{ $vars.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "resolution=merge-duplicates" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "node-upsert-records",
+      "name": "Upsert Climate Records",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1320, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate SPI for the property using recent precipitation data\nconst items = $input.all();\nif (!items.length) return [];\n\nconst propertyId = items[0].json.property_id;\nif (!propertyId || items[0].json.error) return items;\n\n// Get precipitation values from the batch\nconst precipValues = items\n  .map(item => item.json.precipitation_mm)\n  .filter(v => v !== null && v !== undefined && v >= 0);\n\nif (precipValues.length < 3) {\n  return [{ json: { property_id: propertyId, spi: null, reason: 'insufficient_data' } }];\n}\n\n// Simplified SPI: z-score of recent precipitation vs batch mean\nconst mean = precipValues.reduce((a, b) => a + b, 0) / precipValues.length;\nconst variance = precipValues.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / precipValues.length;\nconst stdDev = Math.sqrt(variance);\n\nconst latestPrecip = precipValues[precipValues.length - 1];\nconst spi = stdDev > 0 ? parseFloat(((latestPrecip - mean) / stdDev).toFixed(2)) : 0;\n\nreturn [{ json: { property_id: propertyId, current_spi: spi } }];"
+      },
+      "id": "node-calculate-spi",
+      "name": "Calculate SPI",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 300]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/properties",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "id", "value": "eq.{{ $json.property_id }}" }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "Bearer {{ $vars.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ current_spi: $json.current_spi, last_data_sync: new Date().toISOString() }) }}",
+        "options": {}
+      },
+      "id": "node-update-property-spi",
+      "name": "Update Property SPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1760, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check if SPI indicates a climate event\nconst spiData = $('Calculate SPI').first().json;\nconst spi = spiData.current_spi;\nconst propertyId = spiData.property_id;\n\nif (spi === null || spi === undefined) return [];\n\nconst absSpi = Math.abs(spi);\nlet eventType = null;\nlet severity = null;\n\nif (spi <= -2.0) { eventType = 'drought'; severity = 'critical'; }\nelse if (spi <= -1.5) { eventType = 'drought'; severity = 'warning'; }\nelse if (spi <= -1.0) { eventType = 'drought'; severity = 'watch'; }\nelse if (spi >= 2.0) { eventType = 'excess_rainfall'; severity = 'critical'; }\nelse if (spi >= 1.5) { eventType = 'excess_rainfall'; severity = 'warning'; }\nelse if (spi >= 1.0) { eventType = 'excess_rainfall'; severity = 'watch'; }\n\nif (!eventType) return []; // Normal conditions, no event\n\nreturn [{\n  json: {\n    property_id: propertyId,\n    event_type: eventType,\n    severity: severity,\n    spi_value: spi,\n    start_date: new Date().toISOString().split('T')[0],\n    status: 'active',\n    detected_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node-detect-events",
+      "name": "Detect Climate Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/climate_events",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "Bearer {{ $vars.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "node-create-event",
+      "name": "Create Climate Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2200, 300]
+    }
+  ],
+  "connections": {
+    "Daily 6AM Trigger": {
+      "main": [
+        [{ "node": "Fetch Active Properties", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Active Properties": {
+      "main": [
+        [{ "node": "Split Properties", "type": "main", "index": 0 }]
+      ]
+    },
+    "Split Properties": {
+      "main": [
+        [
+          { "node": "NASA POWER API", "type": "main", "index": 0 },
+          { "node": "Open-Meteo Fallback", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "NASA POWER API": {
+      "main": [
+        [{ "node": "Transform Climate Data", "type": "main", "index": 0 }]
+      ]
+    },
+    "Open-Meteo Fallback": {
+      "main": [
+        [{ "node": "Transform Climate Data", "type": "main", "index": 0 }]
+      ]
+    },
+    "Transform Climate Data": {
+      "main": [
+        [{ "node": "Upsert Climate Records", "type": "main", "index": 0 }]
+      ]
+    },
+    "Upsert Climate Records": {
+      "main": [
+        [{ "node": "Calculate SPI", "type": "main", "index": 0 }]
+      ]
+    },
+    "Calculate SPI": {
+      "main": [
+        [
+          { "node": "Update Property SPI", "type": "main", "index": 0 },
+          { "node": "Detect Climate Events", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Detect Climate Events": {
+      "main": [
+        [{ "node": "Create Climate Event", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": [
+    { "name": "raindebt" },
+    { "name": "climate" },
+    { "name": "daily" }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "raindebt-mvp"
+  },
+  "pinData": {}
+}
