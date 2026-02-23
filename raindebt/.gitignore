@@ -40,3 +40,8 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# gh CLI local install
+gh-cli/
+cli-2.87.2/
+gh_2.87.0_windows_amd64.zip
